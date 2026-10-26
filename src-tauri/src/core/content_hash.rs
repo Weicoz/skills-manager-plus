@@ -40,6 +40,17 @@ pub struct ContentEntry {
     /// so callers don't need a second `metadata()` syscall (or a separate
     /// recursive walk) just to learn when the content last changed.
     pub modified_ms: Option<i64>,
+    /// Size in bytes, captured during the same walk. Plus addition: together
+    /// with `changed_ns` it makes the metadata fingerprint usable as a stand-in
+    /// for the content hash.
+    pub size: u64,
+    /// Inode change time in nanoseconds since the Unix epoch (`ctime`),
+    /// captured during the walk; `None` on non-unix. Plus addition: unlike
+    /// mtime this cannot be preserved by `cp -p`, `rsync --times` or
+    /// `touch -t`, so a replaced file always looks changed even when the old
+    /// timestamp is carried over. Nanoseconds on purpose: two writes inside one
+    /// millisecond would otherwise fingerprint alike.
+    pub changed_ns: Option<i64>,
 }
 
 impl ContentEntry {
@@ -48,16 +59,43 @@ impl ContentEntry {
     }
 }
 
+/// Executable bits off an already-fetched metadata record. Plus addition: the
+/// walk used to stat each file twice (once via WalkDir, once here).
 #[cfg(unix)]
-fn exec_bits_of(path: &Path) -> Option<u32> {
+fn exec_bits_from_meta(meta: &std::fs::Metadata) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
-    path.metadata().ok().map(|m| m.permissions().mode() & 0o111)
+    Some(meta.permissions().mode() & 0o111)
 }
 
 #[cfg(not(unix))]
-fn exec_bits_of(_path: &Path) -> Option<u32> {
+fn exec_bits_from_meta(_meta: &std::fs::Metadata) -> Option<u32> {
     None
 }
+
+/// Inode change time in nanoseconds since the epoch. Plus addition: the
+/// fingerprint leans on this because it cannot be back-dated the way mtime can,
+/// and nanosecond resolution is what stops two writes inside one millisecond
+/// from fingerprinting alike.
+#[cfg(unix)]
+fn changed_ns_of(meta: &std::fs::Metadata) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(
+        meta.ctime()
+            .saturating_mul(1_000_000_000)
+            .saturating_add(meta.ctime_nsec()),
+    )
+}
+
+#[cfg(not(unix))]
+fn changed_ns_of(_meta: &std::fs::Metadata) -> Option<i64> {
+    None
+}
+
+/// Whether the metadata fingerprint can be trusted as a stand-in for the
+/// content hash. Only unix exposes `ctime`, the field a preserved mtime cannot
+/// fake; on every other platform a memoized hash could go stale forever, so the
+/// memo stays off there. Plus addition.
+pub const HASH_MEMO_SUPPORTED: bool = cfg!(unix);
 
 /// Enumerate the files that make up a skill's content, sorted by path and
 /// filtered by the shared ignore-list. Single source of truth for "what is
@@ -117,20 +155,25 @@ fn walk_content_files(dir: &Path, strict: bool, skip_deps: bool) -> Result<Vec<C
             // is a legal filename character on unix.
             #[cfg(windows)]
             let relative_path = relative_path.replace('\\', "/");
-            let exec_bits = exec_bits_of(entry.path());
-            // Reuse WalkDir's already-fetched metadata for the mtime: no extra
-            // stat, and no separate recursive walk to answer "last modified?".
-            let modified_ms = entry
-                .metadata()
-                .ok()
+            // Reuse WalkDir's already-fetched metadata for mtime, size, ctime
+            // and the exec bits: no extra stat, and no separate recursive walk
+            // to answer "last modified?".
+            let meta = entry.metadata().ok();
+            let modified_ms = meta
+                .as_ref()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as i64);
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let changed_ns = meta.as_ref().and_then(changed_ns_of);
+            let exec_bits = meta.as_ref().and_then(exec_bits_from_meta);
             ContentEntry {
                 relative_path,
                 path: entry.into_path(),
                 exec_bits,
                 modified_ms,
+                size,
+                changed_ns,
             }
         })
         .collect();
@@ -141,11 +184,21 @@ fn walk_content_files(dir: &Path, strict: bool, skip_deps: bool) -> Result<Vec<C
 /// caller that already walked the tree (via [`list_content_files`]) can hash
 /// and inspect the same entries without walking again (#248).
 pub fn hash_entries(entries: &[ContentEntry]) -> String {
+    hash_entries_with_status(entries).0
+}
+
+/// [`hash_entries`] plus whether every file could actually be read. A list with
+/// an unreadable file hashes *without* it, and that hash must never be cached
+/// against the fingerprint: a transient EACCES/EIO does not move `ctime`, so the
+/// cached value would keep describing content nobody ever saw. Plus addition.
+pub fn hash_entries_with_status(entries: &[ContentEntry]) -> (String, bool) {
     let mut hasher = Sha256::new();
+    let mut readable = true;
     for entry in entries {
         hasher.update(entry.relative_path.as_bytes());
-        if let Ok(content) = std::fs::read(&entry.path) {
-            hasher.update(&content);
+        match std::fs::read(&entry.path) {
+            Ok(content) => hasher.update(&content),
+            Err(_) => readable = false,
         }
         // Include executable bit so permission-only changes are detected.
         #[cfg(unix)]
@@ -153,7 +206,7 @@ pub fn hash_entries(entries: &[ContentEntry]) -> String {
             hasher.update(&bits.to_le_bytes());
         }
     }
-    hex::encode(hasher.finalize())
+    (hex::encode(hasher.finalize()), readable)
 }
 
 /// Latest content-file modification time (ms since epoch) from a prepared
@@ -165,6 +218,70 @@ pub fn latest_modified_ms(entries: &[ContentEntry]) -> Option<i64> {
 
 pub fn hash_directory(dir: &Path) -> Result<String> {
     Ok(hash_entries(&list_content_files(dir)))
+}
+
+/// Metadata-only fingerprint of a content-file list: relative paths, sizes,
+/// inode change times and executable bits — never file contents, and
+/// deliberately not mtime, which tooling can preserve across a rewrite.
+///
+/// Equal fingerprints mean no file was rewritten, replaced or chmod-ed, so the
+/// content hash recorded for that list cannot have changed.
+///
+/// Size and ctime are in the mix deliberately. mtime alone survives `cp -p`,
+/// `rsync --times` and `touch -t`, so a replaced file would keep its old
+/// timestamp and a hash cached against mtime alone would keep describing the
+/// previous content. ctime cannot be back-dated by those tools, and a rewrite
+/// of different length moves size.
+///
+/// Plus addition: an unchanged library reindexes by walking the tree (one stat
+/// per file) instead of reading every file.
+pub fn fingerprint_entries(entries: &[ContentEntry]) -> String {
+    let mut hasher = Sha256::new();
+    for entry in entries {
+        let path = entry.relative_path.as_bytes();
+        hasher.update((path.len() as u64).to_le_bytes());
+        hasher.update(path);
+        hasher.update(entry.size.to_le_bytes());
+        hasher.update(entry.changed_ns.unwrap_or(i64::MIN).to_le_bytes());
+        #[cfg(unix)]
+        if let Some(bits) = entry.exec_bits {
+            hasher.update(bits.to_le_bytes());
+        }
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// One memoized directory hash.
+pub struct MemoizedHash {
+    pub hash: String,
+    pub fingerprint: String,
+    /// False when a file could not be read. The hash is still usable for this
+    /// run, but must not be cached against the fingerprint.
+    pub cacheable: bool,
+}
+
+/// [`hash_directory`] that also reports the fingerprint the hash was computed
+/// from, reusing `cached` when the freshly walked fingerprint still matches.
+/// The returned fingerprint is always current, so the caller can store it
+/// again. Only the walking cost is paid on a hit; the files are never read.
+pub fn hash_directory_memoized(dir: &Path, cached: Option<(&str, &str)>) -> MemoizedHash {
+    let entries = list_content_files(dir);
+    let fingerprint = fingerprint_entries(&entries);
+    if let Some((prev_fingerprint, prev_hash)) = cached {
+        if prev_fingerprint == fingerprint {
+            return MemoizedHash {
+                hash: prev_hash.to_string(),
+                fingerprint,
+                cacheable: true,
+            };
+        }
+    }
+    let (hash, readable) = hash_entries_with_status(&entries);
+    MemoizedHash {
+        hash,
+        fingerprint,
+        cacheable: readable,
+    }
 }
 
 /// True when `content` is text this may safely fold: valid UTF-8 with no NUL.
@@ -410,6 +527,8 @@ mod tests {
             path,
             exec_bits: None,
             modified_ms: None,
+            size: 0,
+            changed_ns: None,
         }
     }
 
@@ -750,4 +869,111 @@ mod tests {
         assert!(by_name("run.sh").is_executable());
         assert!(!by_name("plain.txt").is_executable());
     }
+
+    // ---- plus: memoized content hash ----
+
+    #[test]
+    fn memoized_hash_matches_full_hash_and_hits_on_second_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("SKILL.md"), b"one").unwrap();
+        let first = hash_directory_memoized(tmp.path(), None);
+        assert!(first.cacheable, "readable files must be cacheable");
+        assert_eq!(hash_directory(tmp.path()).unwrap(), first.hash);
+        let second = hash_directory_memoized(tmp.path(), Some((&first.fingerprint, &first.hash)));
+        assert_eq!(
+            first.fingerprint, second.fingerprint,
+            "an unchanged directory must fingerprint identically"
+        );
+        assert_eq!(
+            first.hash, second.hash,
+            "a memo hit must return the recorded hash"
+        );
+    }
+
+    #[test]
+    fn memoized_hash_recomputes_after_same_length_rewrite_with_preserved_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("SKILL.md");
+        std::fs::write(&p, b"aaaa").unwrap();
+        let first = hash_directory_memoized(tmp.path(), None);
+
+        // Rewrite with different content of the same length, then put the old
+        // timestamps back the way `cp -p`, `unzip` and `rsync -a` do. Only
+        // ctime can still tell the difference, which is why the fingerprint
+        // includes it.
+        let meta = std::fs::metadata(&p).unwrap();
+        std::fs::write(&p, b"bbbb").unwrap();
+        {
+            use std::fs::FileTimes;
+            let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            let times = FileTimes::new()
+                .set_accessed(meta.accessed().unwrap())
+                .set_modified(meta.modified().unwrap());
+            f.set_times(times).unwrap();
+        }
+
+        let second = hash_directory_memoized(tmp.path(), Some((&first.fingerprint, &first.hash)));
+        assert_ne!(
+            first.hash, second.hash,
+            "a rewrite that keeps size and mtime must still change the hash"
+        );
+        assert_ne!(
+            first.fingerprint, second.fingerprint,
+            "ctime must move when a file is replaced"
+        );
+    }
+
+    #[test]
+    fn memoized_hash_follows_added_and_removed_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("SKILL.md"), b"one").unwrap();
+        let first = hash_directory_memoized(tmp.path(), None);
+        std::fs::write(tmp.path().join("extra.md"), b"two").unwrap();
+        let second = hash_directory_memoized(tmp.path(), Some((&first.fingerprint, &first.hash)));
+        assert_ne!(first.fingerprint, second.fingerprint);
+        assert_eq!(hash_directory(tmp.path()).unwrap(), second.hash);
+    }
+
+    #[test]
+    fn memo_is_only_enabled_where_ctime_exists() {
+        #[cfg(unix)]
+        assert!(HASH_MEMO_SUPPORTED);
+        #[cfg(not(unix))]
+        assert!(!HASH_MEMO_SUPPORTED);
+    }
+
+
+    #[cfg(unix)]
+    #[test]
+    fn memoized_hash_refuses_to_cache_when_a_file_cannot_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc_geteuid() } == 0 {
+            return; // root ignores the mode bits, so this case proves nothing
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("skill");
+        std::fs::create_dir(&dir).unwrap();
+        let p = dir.join("SKILL.md");
+        std::fs::write(&p, b"secret").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = hash_directory_memoized(&dir, None);
+        assert!(
+            !denied.cacheable,
+            "an unreadable file must disable caching: the failure does not move ctime"
+        );
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let readable = hash_directory_memoized(&dir, None);
+        assert!(readable.cacheable, "a readable tree must be cacheable again");
+        assert_ne!(
+            denied.hash, readable.hash,
+            "the uncached hash was missing a file, so it must differ"
+        );
+    }
+
+    #[cfg(unix)]
+    extern "C" {
+        #[link_name = "geteuid"]
+        fn libc_geteuid() -> u32;
+    }
+
 }

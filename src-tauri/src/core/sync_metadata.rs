@@ -15,6 +15,21 @@ use super::skill_store::{ScenarioRecord, SkillRecord, SkillStore};
 const SCHEMA_VERSION: u32 = 1;
 const APP_MIN_VERSION: &str = "2.0.0";
 
+/// Settings key holding the per-skill `(fingerprint, content hash)` memo.
+/// Plus addition: lets a reindex reuse unchanged content hashes instead of
+/// re-reading every file under the library. The memo is advisory only — a
+/// missing or stale entry just costs a full hash.
+///
+/// Bumped to `v2` with the fingerprint recipe (path+size+ctime_ns+exec bits);
+/// a key shared with an older recipe would silently mix two incompatible
+/// definitions of "unchanged".
+const HASH_MEMO_KEY: &str = "content_hash_memo_v2";
+/// When the memo was last rebuilt in full. Ages out, so one bad entry cannot
+/// stay authoritative forever. Plus addition.
+const HASH_MEMO_VERIFIED_KEY: &str = "content_hash_memo_verified_at";
+/// How long a memo may be trusted before it is rebuilt from scratch.
+const HASH_MEMO_FULL_VERIFY_SECS: i64 = 86_400;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SchemaFile {
     pub schema_version: u32,
@@ -159,6 +174,13 @@ pub fn reindex_from_metadata(store: &SkillStore) -> Result<()> {
     reindex_from_metadata_unlocked(store)
 }
 
+/// A memo entry is only usable when both halves look like SHA-256 digests; a
+/// hand-edited or truncated settings row must not become an authoritative
+/// content hash. Plus addition.
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 pub(crate) fn reindex_from_metadata_unlocked(store: &SkillStore) -> Result<()> {
     if !metadata_exists() {
         return Ok(());
@@ -205,6 +227,45 @@ pub(crate) fn reindex_from_metadata_unlocked(store: &SkillStore) -> Result<()> {
     // merge collision reshuffles) cannot trip the UNIQUE constraint mid-loop.
     store.park_central_paths_for_reindex()?;
 
+    // Plus: previous run's content hashes, keyed by skill id. A matching
+    // fingerprint means the files are untouched, so the recorded hash can be
+    // reused without reading the library.
+    //
+    // Three guards keep a stale entry from becoming permanent: the memo is off
+    // on platforms without `ctime` (a preserved mtime would fake "unchanged"),
+    // it is rebuilt in full once it is older than HASH_MEMO_FULL_VERIFY_SECS,
+    // and a hit that disagrees with the database is discarded below. Only a
+    // full rebuild advances the timestamp, so an active library cannot postpone
+    // the periodic check indefinitely. A settings read failure degrades to
+    // "no memo" instead of aborting the reindex.
+    let now_secs = chrono::Utc::now().timestamp();
+    let memo_fresh = store
+        .get_setting(HASH_MEMO_VERIFIED_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .map(|at| now_secs.saturating_sub(at) <= HASH_MEMO_FULL_VERIFY_SECS)
+        .unwrap_or(false);
+    let memo_active = super::content_hash::HASH_MEMO_SUPPORTED && memo_fresh;
+    let hash_memo: HashMap<String, (String, String)> = if memo_active {
+        store
+            .get_setting(HASH_MEMO_KEY)
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<HashMap<String, (String, String)>>(&raw).ok())
+            .map(|memo| {
+                memo.into_iter()
+                    .filter(|(_, (fingerprint, hash))| {
+                        is_sha256_hex(fingerprint) && is_sha256_hex(hash)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    let mut next_memo: HashMap<String, (String, String)> = HashMap::with_capacity(skills.len());
+
     for meta in skills {
         let skill_dir = skills_root.join(&meta.path);
         if !skill_dir.is_dir() {
@@ -229,7 +290,27 @@ pub(crate) fn reindex_from_metadata_unlocked(store: &SkillStore) -> Result<()> {
         };
         let central_path = skill_dir.to_string_lossy().to_string();
 
-        let new_hash = super::content_hash::hash_directory(&skill_dir).ok();
+        // Plus: skip the content read when the fingerprints match. The
+        // database is the authority: a memo value that disagrees with the
+        // recorded hash means the memo is stale, so this skill is hashed in
+        // full instead of propagating the disagreement.
+        let cached = hash_memo
+            .get(&meta.skill_id)
+            .and_then(|(fingerprint, hash)| match previous.and_then(|p| p.content_hash.as_deref())
+            {
+                Some(db_hash) if db_hash != hash => None,
+                _ => Some((fingerprint.as_str(), hash.as_str())),
+            });
+        let memoized = super::content_hash::hash_directory_memoized(&skill_dir, cached);
+        // An unreadable file makes the hash unfit to cache: the read failure
+        // does not move ctime, so caching it would survive the failure.
+        if memoized.cacheable {
+            next_memo.insert(
+                meta.skill_id.clone(),
+                (memoized.fingerprint.clone(), memoized.hash.clone()),
+            );
+        }
+        let new_hash = Some(memoized.hash);
         let updated_at = match previous {
             Some(prev) if prev.content_hash == new_hash => prev.updated_at,
             _ => now,
@@ -266,6 +347,30 @@ pub(crate) fn reindex_from_metadata_unlocked(store: &SkillStore) -> Result<()> {
         store.replace_scenarios_from_metadata(&scenarios)?;
         store.replace_scenario_memberships_from_metadata(&memberships)?;
     }
+
+    // Plus: persist the memo only once the reindex succeeded, so a failed run
+    // never leaves a fingerprint behind that claims unverified content. Write
+    // only when it actually changed: a read-only CLI command must not turn into
+    // a database write on every invocation.
+    if super::content_hash::HASH_MEMO_SUPPORTED {
+        let changed = next_memo != hash_memo;
+        if changed {
+            if let Ok(raw) = serde_json::to_string(&next_memo) {
+                if let Err(err) = store.set_setting(HASH_MEMO_KEY, &raw) {
+                    eprintln!("reindex: content hash memo not persisted: {err:#}");
+                }
+            }
+        }
+        // Only a run that rebuilt from scratch counts as a full verification;
+        // a run that merely re-hashed a few changed skills must not postpone
+        // the next full one, or the TTL would never expire on an active library.
+        if !memo_fresh {
+            if let Err(err) = store.set_setting(HASH_MEMO_VERIFIED_KEY, &now_secs.to_string()) {
+                eprintln!("reindex: content hash memo timestamp not persisted: {err:#}");
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -978,4 +1083,202 @@ mod tests {
             "updated_at must be refreshed when skill content changes"
         );
     }
+
+    // ---- plus: content hash memo ----
+
+    #[test]
+    fn reindex_reuses_the_memo_instead_of_rehashing() {
+        let repo = test_repo();
+        let skill_dir = write_skill_dir("memo-skill");
+        let mut record = sample_skill("skill-memo", &skill_dir);
+        record.content_hash =
+            Some(super::super::content_hash::hash_directory(&skill_dir).unwrap());
+        repo.store.insert_skill(&record).unwrap();
+        write_all_from_db_unlocked(&repo.store).unwrap();
+
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+        let memo_raw = repo.store.get_setting(HASH_MEMO_KEY).unwrap().unwrap();
+        let memo: HashMap<String, (String, String)> = serde_json::from_str(&memo_raw).unwrap();
+        let fingerprint = memo
+            .get("skill-memo")
+            .expect("the first pass must record this skill")
+            .0
+            .clone();
+
+        // Poison the memo AND the database with the same wrong digest: a real
+        // memo hit returns the poisoned value, while a full rehash would put
+        // the true hash back and fail the assertion. (An earlier version of
+        // this test passed even with memo reading disabled.)
+        let poison = "f".repeat(64);
+        let poisoned_memo =
+            serde_json::json!({ "skill-memo": [fingerprint, poison.clone()] }).to_string();
+        repo.store.set_setting(HASH_MEMO_KEY, &poisoned_memo).unwrap();
+        let mut poisoned_record = repo.store.get_skill_by_id("skill-memo").unwrap().unwrap();
+        poisoned_record.content_hash = Some(poison.clone());
+        repo.store.upsert_skill(&poisoned_record).unwrap();
+
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+        let after = repo.store.get_skill_by_id("skill-memo").unwrap().unwrap();
+        assert_eq!(
+            after.content_hash.as_deref(),
+            Some(poison.as_str()),
+            "an unchanged fingerprint must reuse the memo instead of rehashing"
+        );
+    }
+
+    #[test]
+    fn reindex_discards_a_memo_entry_that_disagrees_with_the_database() {
+        let repo = test_repo();
+        let skill_dir = write_skill_dir("stale-memo");
+        let mut record = sample_skill("skill-stale", &skill_dir);
+        let real_hash = super::super::content_hash::hash_directory(&skill_dir).unwrap();
+        record.content_hash = Some(real_hash.clone());
+        repo.store.insert_skill(&record).unwrap();
+        write_all_from_db_unlocked(&repo.store).unwrap();
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+
+        // Poison the memo with a well-formed but wrong pair: the database still
+        // holds the real hash, so the reindex must re-derive it rather than
+        // propagate the disagreement.
+        let bogus = "0".repeat(64);
+        let poisoned = serde_json::json!({ "skill-stale": [bogus.clone(), bogus] }).to_string();
+        repo.store.set_setting(HASH_MEMO_KEY, &poisoned).unwrap();
+
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+        let after = repo.store.get_skill_by_id("skill-stale").unwrap().unwrap();
+        assert_eq!(
+            after.content_hash.as_deref(),
+            Some(real_hash.as_str()),
+            "a memo that disagrees with the database must be replaced by the real hash"
+        );
+        assert_ne!(
+            repo.store.get_setting(HASH_MEMO_KEY).unwrap().unwrap(),
+            poisoned,
+            "the poisoned memo must be rewritten"
+        );
+    }
+
+    #[test]
+    fn reindex_rebuilds_in_full_when_the_memo_has_aged_out() {
+        let repo = test_repo();
+        let skill_dir = write_skill_dir("aged-memo");
+        let mut record = sample_skill("skill-aged", &skill_dir);
+        let real_hash = super::super::content_hash::hash_directory(&skill_dir).unwrap();
+        record.content_hash = Some(real_hash.clone());
+        repo.store.insert_skill(&record).unwrap();
+        write_all_from_db_unlocked(&repo.store).unwrap();
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+
+        let memo_raw = repo.store.get_setting(HASH_MEMO_KEY).unwrap().unwrap();
+        let memo: HashMap<String, (String, String)> = serde_json::from_str(&memo_raw).unwrap();
+        let fingerprint = memo.get("skill-aged").unwrap().0.clone();
+
+        // Same poison as the reuse test, but the verification stamp is stale:
+        // the memo must be ignored and the real hash re-derived from disk.
+        let poison = "e".repeat(64);
+        let poisoned_memo =
+            serde_json::json!({ "skill-aged": [fingerprint, poison.clone()] }).to_string();
+        repo.store.set_setting(HASH_MEMO_KEY, &poisoned_memo).unwrap();
+        let mut poisoned_record = repo.store.get_skill_by_id("skill-aged").unwrap().unwrap();
+        poisoned_record.content_hash = Some(poison.clone());
+        repo.store.upsert_skill(&poisoned_record).unwrap();
+        repo.store.set_setting(HASH_MEMO_VERIFIED_KEY, "1").unwrap();
+
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+        let after = repo.store.get_skill_by_id("skill-aged").unwrap().unwrap();
+        assert_eq!(
+            after.content_hash.as_deref(),
+            Some(real_hash.as_str()),
+            "an aged-out memo must be rebuilt from disk"
+        );
+        let stamped = repo
+            .store
+            .get_setting(HASH_MEMO_VERIFIED_KEY)
+            .unwrap()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+        assert!(stamped > 1, "a full rebuild must re-stamp the verification");
+    }
+
+    #[test]
+    fn an_incremental_run_does_not_advance_the_full_verification_stamp() {
+        let repo = test_repo();
+        let skill_dir = write_skill_dir("ttl-skill");
+        let mut record = sample_skill("skill-ttl", &skill_dir);
+        record.content_hash =
+            Some(super::super::content_hash::hash_directory(&skill_dir).unwrap());
+        repo.store.insert_skill(&record).unwrap();
+        write_all_from_db_unlocked(&repo.store).unwrap();
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+
+        // A fresh stamp (an hour ago) must survive a run that only re-hashed a
+        // changed skill; otherwise an active library would never reach a full
+        // check, which is exactly the defect this guards against.
+        let stamp = chrono::Utc::now().timestamp() - 3600;
+        repo.store
+            .set_setting(HASH_MEMO_VERIFIED_KEY, &stamp.to_string())
+            .unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            b"---
+name: ttl-skill
+---
+
+changed
+",
+        )
+        .unwrap();
+
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+        let after = repo
+            .store
+            .get_setting(HASH_MEMO_VERIFIED_KEY)
+            .unwrap()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+        assert_eq!(
+            after, stamp,
+            "an incremental run must not advance the full-verification stamp"
+        );
+    }
+
+    #[test]
+    fn memo_entries_that_are_not_digests_are_ignored() {
+        let repo = test_repo();
+        let skill_dir = write_skill_dir("dirty-memo");
+        let mut record = sample_skill("skill-dirty", &skill_dir);
+        let real_hash = super::super::content_hash::hash_directory(&skill_dir).unwrap();
+        // Database and memo both say "zz": the digest-shape check is then the
+        // only thing standing between a hand-edited settings row and the
+        // content hash, since the database-agreement guard sees no conflict.
+        record.content_hash = Some("zz".to_string());
+        repo.store.insert_skill(&record).unwrap();
+        write_all_from_db_unlocked(&repo.store).unwrap();
+
+        let stale = chrono::Utc::now().timestamp();
+        repo.store
+            .set_setting(HASH_MEMO_VERIFIED_KEY, &stale.to_string())
+            .unwrap();
+        let dirty = serde_json::json!({ "skill-dirty": ["zz", "zz"] }).to_string();
+        repo.store.set_setting(HASH_MEMO_KEY, &dirty).unwrap();
+
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+        let after = repo.store.get_skill_by_id("skill-dirty").unwrap().unwrap();
+        assert_eq!(
+            after.content_hash.as_deref(),
+            Some(real_hash.as_str()),
+            "a malformed memo entry must never become the content hash"
+        );
+    }
+
+    #[test]
+    fn memo_values_must_look_like_digests() {
+        assert!(is_sha256_hex(&"a".repeat(64)));
+        assert!(!is_sha256_hex(""));
+        assert!(!is_sha256_hex(&"a".repeat(63)));
+        assert!(!is_sha256_hex(&"g".repeat(64)));
+    }
+
 }
