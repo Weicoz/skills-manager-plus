@@ -15,6 +15,14 @@ use super::skill_store::{ScenarioRecord, SkillRecord, SkillStore};
 const SCHEMA_VERSION: u32 = 1;
 const APP_MIN_VERSION: &str = "2.0.0";
 
+/// Settings key holding the metadata manifest fingerprint.
+/// Plus addition: lets reindex skip reading and parsing 1000+ JSON metadata
+/// files when the metadata snapshot tree has not been modified since the last
+/// successful database sync.
+const METADATA_MANIFEST_KEY: &str = "sync_metadata_manifest_fingerprint_v1";
+/// When the metadata manifest was last verified in full. Rebuilt after 24h.
+const METADATA_MANIFEST_VERIFIED_KEY: &str = "sync_metadata_manifest_verified_at";
+
 /// Settings key holding the per-skill `(fingerprint, content hash)` memo.
 /// Plus addition: lets a reindex reuse unchanged content hashes instead of
 /// re-reading every file under the library. The memo is advisory only — a
@@ -132,6 +140,21 @@ pub(crate) fn write_all_from_db_unlocked(store: &SkillStore) -> Result<()> {
     write_skill_records_from_db(store)?;
     write_scenario_records_from_db(store)?;
     remove_stale_metadata_files(store)?;
+
+    // Plus: update manifest fingerprint under lock after writing all metadata files.
+    // Note: do NOT update METADATA_MANIFEST_VERIFIED_KEY here! Only a full read-back
+    // verification in reindex_from_metadata_unlocked advances the verification timestamp.
+    if super::content_hash::HASH_MEMO_SUPPORTED {
+        if let Some(manifest) = fingerprint_metadata_tree(&metadata_dir()) {
+            let stored = store.get_setting(METADATA_MANIFEST_KEY).ok().flatten();
+            if stored.as_deref() != Some(&manifest.fingerprint) {
+                if let Err(err) = store.set_setting(METADATA_MANIFEST_KEY, &manifest.fingerprint) {
+                    eprintln!("write_all_from_db: metadata manifest fingerprint not persisted: {err:#}");
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -163,6 +186,99 @@ pub(crate) fn write_scenario_skill_unlocked(
         skill_id: skill_id.to_string(),
         sort_order: index as i32,
         tools,
+    })?;
+
+    // Plus: invalidate stored manifest so the next reindex runs a full pass.
+    // Avoids walking and hashing 1000+ files on per-(skill, agent) single-file writes.
+    if super::content_hash::HASH_MEMO_SUPPORTED {
+        let _ = store.set_setting(METADATA_MANIFEST_KEY, "");
+    }
+
+    Ok(())
+}
+
+/// A snapshot summary of the metadata directory tree. Plus addition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataManifest {
+    fingerprint: String,
+    skill_file_count: usize,
+}
+
+/// Computes a fast metadata tree fingerprint by collecting (rel_path, size, ctime_ns)
+/// for all JSON files under metadata_dir. Uses metadata syscalls only (no file reads).
+/// Plus addition.
+fn fingerprint_metadata_tree(dir: &Path) -> Option<MetadataManifest> {
+    if !dir.is_dir() {
+        return None;
+    }
+    let mut entries = Vec::new();
+    let mut skill_file_count = 0;
+
+    let walk = WalkDir::new(dir)
+        .min_depth(1)
+        .max_depth(6)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !name.starts_with('.') || name == ".skills-manager"
+        });
+
+    for entry in walk {
+        let entry = entry.ok()?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let rel = path.strip_prefix(dir).ok()?.to_string_lossy().to_string();
+        if rel.starts_with("skills/") {
+            skill_file_count += 1;
+        }
+        let meta = entry.metadata().ok()?;
+        let size = meta.len();
+        #[cfg(unix)]
+        let changed = {
+            use std::os::unix::fs::MetadataExt;
+            meta.ctime()
+                .saturating_mul(1_000_000_000)
+                .saturating_add(meta.ctime_nsec())
+        };
+        #[cfg(not(unix))]
+        let changed = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        entries.push((rel, size, changed));
+    }
+
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(dir.to_string_lossy().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(&(entries.len() as u64).to_le_bytes());
+    hasher.update(b"\0");
+
+    for (rel, size, changed) in entries {
+        hasher.update(rel.as_bytes());
+        hasher.update(b":");
+        hasher.update(&size.to_le_bytes());
+        hasher.update(b":");
+        hasher.update(&changed.to_le_bytes());
+        hasher.update(b"\n");
+    }
+
+    let fingerprint = hex::encode(hasher.finalize());
+    Some(MetadataManifest {
+        fingerprint,
+        skill_file_count,
     })
 }
 
@@ -181,6 +297,28 @@ fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Moves an orphan metadata JSON file to `.skills-manager/.trash/<id>.json`.
+/// Plus addition: preserves metadata recoverability rather than hard-deleting,
+/// while removing the file from `skills/` so file count aligns with database.
+fn quarantine_orphan_metadata(meta_dir: &Path, skill_id: &str) -> bool {
+    let orphan_meta = meta_dir.join(format!("skills/{}.json", skill_id));
+    if !orphan_meta.is_file() {
+        return false;
+    }
+    let trash_dir = meta_dir.join(".trash");
+    if std::fs::create_dir_all(&trash_dir).is_err() {
+        return false;
+    }
+    let target = trash_dir.join(format!("{}.json", skill_id));
+    if target.exists() {
+        let ts = chrono::Utc::now().timestamp_millis();
+        let target_ts = trash_dir.join(format!("{}.{}.json", skill_id, ts));
+        std::fs::rename(&orphan_meta, &target_ts).is_ok()
+    } else {
+        std::fs::rename(&orphan_meta, &target).is_ok()
+    }
+}
+
 pub(crate) fn reindex_from_metadata_unlocked(store: &SkillStore) -> Result<()> {
     if !metadata_exists() {
         return Ok(());
@@ -189,43 +327,48 @@ pub(crate) fn reindex_from_metadata_unlocked(store: &SkillStore) -> Result<()> {
         bail!("incomplete sync metadata snapshot: missing schema.json or skills directory");
     }
 
-    let skills = read_skill_files()?;
-    if skills.is_empty() && central_repo_has_valid_skill_dirs()? {
-        return Err(EmptySkillMetadata.into());
-    }
-    ensure_unique_path_keys(&skills)?;
+    let meta_dir = metadata_dir();
+    let mut current_manifest = if super::content_hash::HASH_MEMO_SUPPORTED {
+        fingerprint_metadata_tree(&meta_dir)
+    } else {
+        None
+    };
+    let existing_skills = store.get_all_skills()?;
 
-    let has_complete_scenario_snapshot = metadata_has_complete_scenario_snapshot();
-    let scenarios = if has_complete_scenario_snapshot {
-        read_scenario_files()?
+    let now_secs = chrono::Utc::now().timestamp();
+    let manifest_fresh = store
+        .get_setting(METADATA_MANIFEST_VERIFIED_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .map(|at| now_secs.saturating_sub(at) <= HASH_MEMO_FULL_VERIFY_SECS)
+        .unwrap_or(false);
+
+    // Plus: check whether the metadata tree itself is unchanged since the last
+    // successful sync. If the manifest fingerprint matches and the skill count
+    // agrees and the verification stamp is still within 24h TTL, we can skip
+    // re-reading and deserializing 1000+ metadata JSON files and skip parking
+    // central paths / replacing scenarios / memberships.
+    let metadata_unchanged = if super::content_hash::HASH_MEMO_SUPPORTED && manifest_fresh {
+        if let Some(ref manifest) = current_manifest {
+            if manifest.skill_file_count > 0 && existing_skills.len() == manifest.skill_file_count {
+                let stored_manifest = store
+                    .get_setting(METADATA_MANIFEST_KEY)
+                    .ok()
+                    .flatten();
+                stored_manifest.as_deref() == Some(&manifest.fingerprint)
+            } else {
+                false
+            }
+        } else {
+            false
+        }
     } else {
-        Vec::new()
+        false
     };
-    let memberships = if has_complete_scenario_snapshot {
-        read_membership_files()?
-    } else {
-        Vec::new()
-    };
+
     let now = chrono::Utc::now().timestamp_millis();
     let skills_root = central_repo::skills_dir();
-
-    let metadata_ids: HashSet<String> = skills.iter().map(|m| m.skill_id.clone()).collect();
-    for existing in store.get_all_skills()? {
-        if !metadata_ids.contains(&existing.id) {
-            store.delete_skill(&existing.id)?;
-        }
-    }
-
-    let existing_by_id: HashMap<String, SkillRecord> = store
-        .get_all_skills()?
-        .into_iter()
-        .map(|skill| (skill.id.clone(), skill))
-        .collect();
-
-    // Every surviving row gets its central_path rewritten below; park them
-    // on placeholders first so path reassignments between skills (renames or
-    // merge collision reshuffles) cannot trip the UNIQUE constraint mid-loop.
-    store.park_central_paths_for_reindex()?;
 
     // Plus: previous run's content hashes, keyed by skill id. A matching
     // fingerprint means the files are untouched, so the recorded hash can be
@@ -238,7 +381,6 @@ pub(crate) fn reindex_from_metadata_unlocked(store: &SkillStore) -> Result<()> {
     // full rebuild advances the timestamp, so an active library cannot postpone
     // the periodic check indefinitely. A settings read failure degrades to
     // "no memo" instead of aborting the reindex.
-    let now_secs = chrono::Utc::now().timestamp();
     let memo_fresh = store
         .get_setting(HASH_MEMO_VERIFIED_KEY)
         .ok()
@@ -264,88 +406,187 @@ pub(crate) fn reindex_from_metadata_unlocked(store: &SkillStore) -> Result<()> {
     } else {
         HashMap::new()
     };
-    let mut next_memo: HashMap<String, (String, String)> = HashMap::with_capacity(skills.len());
+    let mut next_memo: HashMap<String, (String, String)> =
+        HashMap::with_capacity(existing_skills.len());
+    let mut orphan_deleted = false;
 
-    for meta in skills {
-        let skill_dir = skills_root.join(&meta.path);
-        if !skill_dir.is_dir() {
-            store.delete_skill(&meta.skill_id)?;
-            continue;
+    if metadata_unchanged {
+        // Fast path: metadata JSON files are identical to stored database state.
+        // We only check each skill's content directory for modifications (e.g.
+        // edited SKILL.md or added files) or memo invalidation, updating the DB
+        // only when content actually changed.
+        for skill in existing_skills {
+            let skill_dir = if Path::new(&skill.central_path).is_absolute() {
+                PathBuf::from(&skill.central_path)
+            } else {
+                skills_root.join(&skill.central_path)
+            };
+            if !skill_dir.is_dir() {
+                if skills_root.is_dir() {
+                    store.delete_skill(&skill.id)?;
+                    if quarantine_orphan_metadata(&meta_dir, &skill.id) {
+                        orphan_deleted = true;
+                    }
+                }
+                continue;
+            }
+
+            let cached = hash_memo
+                .get(&skill.id)
+                .and_then(|(fingerprint, hash)| match skill.content_hash.as_deref() {
+                    Some(db_hash) if db_hash != hash => None,
+                    _ => Some((fingerprint.as_str(), hash.as_str())),
+                });
+            let memoized = super::content_hash::hash_directory_memoized(&skill_dir, cached);
+            if memoized.cacheable {
+                next_memo.insert(
+                    skill.id.clone(),
+                    (memoized.fingerprint.clone(), memoized.hash.clone()),
+                );
+            }
+
+            let new_hash = Some(memoized.hash);
+            if skill.content_hash != new_hash {
+                let parsed = skill_metadata::parse_skill_md(&skill_dir);
+                let inferred_name = skill_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown-skill".to_string());
+                let name = parsed
+                    .name
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(inferred_name);
+
+                let mut updated = skill;
+                updated.name = name;
+                updated.description = parsed.description;
+                updated.content_hash = new_hash;
+                updated.updated_at = now;
+                store.upsert_skill(&updated)?;
+            }
         }
+    } else {
+        let skills = read_skill_files()?;
+        if skills.is_empty() && central_repo_has_valid_skill_dirs()? {
+            return Err(EmptySkillMetadata.into());
+        }
+        ensure_unique_path_keys(&skills)?;
 
-        let parsed = skill_metadata::parse_skill_md(&skill_dir);
-        let inferred_name = skill_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown-skill".to_string());
-        let name = parsed
-            .name
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(inferred_name);
-        let previous = existing_by_id.get(&meta.skill_id);
-        let source_ref = if matches!(meta.source.source_type.as_str(), "import" | "local") {
-            previous.and_then(|s| s.source_ref.clone())
+        let has_complete_scenario_snapshot = metadata_has_complete_scenario_snapshot();
+        let scenarios = if has_complete_scenario_snapshot {
+            read_scenario_files()?
         } else {
-            meta.source.ref_.clone()
+            Vec::new()
         };
-        let central_path = skill_dir.to_string_lossy().to_string();
+        let memberships = if has_complete_scenario_snapshot {
+            read_membership_files()?
+        } else {
+            Vec::new()
+        };
 
-        // Plus: skip the content read when the fingerprints match. The
-        // database is the authority: a memo value that disagrees with the
-        // recorded hash means the memo is stale, so this skill is hashed in
-        // full instead of propagating the disagreement.
-        let cached = hash_memo
-            .get(&meta.skill_id)
-            .and_then(|(fingerprint, hash)| match previous.and_then(|p| p.content_hash.as_deref())
-            {
-                Some(db_hash) if db_hash != hash => None,
-                _ => Some((fingerprint.as_str(), hash.as_str())),
-            });
-        let memoized = super::content_hash::hash_directory_memoized(&skill_dir, cached);
-        // An unreadable file makes the hash unfit to cache: the read failure
-        // does not move ctime, so caching it would survive the failure.
-        if memoized.cacheable {
-            next_memo.insert(
-                meta.skill_id.clone(),
-                (memoized.fingerprint.clone(), memoized.hash.clone()),
-            );
+        let metadata_ids: HashSet<String> = skills.iter().map(|m| m.skill_id.clone()).collect();
+        for existing in &existing_skills {
+            if !metadata_ids.contains(&existing.id) {
+                store.delete_skill(&existing.id)?;
+            }
         }
-        let new_hash = Some(memoized.hash);
-        let updated_at = match previous {
-            Some(prev) if prev.content_hash == new_hash => prev.updated_at,
-            _ => now,
-        };
 
-        let record = SkillRecord {
-            id: meta.skill_id.clone(),
-            name,
-            description: parsed.description,
-            source_type: meta.source.source_type.clone(),
-            source_ref,
-            source_ref_resolved: previous.and_then(|s| s.source_ref_resolved.clone()),
-            source_subpath: meta.source.subpath.clone(),
-            source_branch: meta.source.branch.clone(),
-            source_revision: previous.and_then(|s| s.source_revision.clone()),
-            remote_revision: previous.and_then(|s| s.remote_revision.clone()),
-            central_path,
-            content_hash: new_hash,
-            enabled: meta.enabled,
-            created_at: previous.map(|s| s.created_at).unwrap_or(now),
-            updated_at,
-            status: "ok".to_string(),
-            update_status: previous
-                .map(|s| s.update_status.clone())
-                .unwrap_or_else(|| "unknown".to_string()),
-            last_checked_at: previous.and_then(|s| s.last_checked_at),
-            last_check_error: previous.and_then(|s| s.last_check_error.clone()),
-        };
-        store.upsert_skill(&record)?;
-        store.set_tags_for_skill(&meta.skill_id, &meta.tags)?;
-    }
+        let existing_by_id: HashMap<String, SkillRecord> = existing_skills
+            .into_iter()
+            .map(|skill| (skill.id.clone(), skill))
+            .collect();
 
-    if has_complete_scenario_snapshot {
-        store.replace_scenarios_from_metadata(&scenarios)?;
-        store.replace_scenario_memberships_from_metadata(&memberships)?;
+        // Every surviving row gets its central_path rewritten below; park them
+        // on placeholders first so path reassignments between skills (renames or
+        // merge collision reshuffles) cannot trip the UNIQUE constraint mid-loop.
+        store.park_central_paths_for_reindex()?;
+
+        for meta in skills {
+            let skill_dir = skills_root.join(&meta.path);
+            if !skill_dir.is_dir() {
+                if skills_root.is_dir() {
+                    store.delete_skill(&meta.skill_id)?;
+                    if quarantine_orphan_metadata(&meta_dir, &meta.skill_id) {
+                        orphan_deleted = true;
+                    }
+                }
+                continue;
+            }
+
+            let parsed = skill_metadata::parse_skill_md(&skill_dir);
+            let inferred_name = skill_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown-skill".to_string());
+            let name = parsed
+                .name
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(inferred_name);
+            let previous = existing_by_id.get(&meta.skill_id);
+            let source_ref = if matches!(meta.source.source_type.as_str(), "import" | "local") {
+                previous.and_then(|s| s.source_ref.clone())
+            } else {
+                meta.source.ref_.clone()
+            };
+            let central_path = skill_dir.to_string_lossy().to_string();
+
+            // Plus: skip the content read when the fingerprints match. The
+            // database is the authority: a memo value that disagrees with the
+            // recorded hash means the memo is stale, so this skill is hashed in
+            // full instead of propagating the disagreement.
+            let cached = hash_memo
+                .get(&meta.skill_id)
+                .and_then(|(fingerprint, hash)| match previous.and_then(|p| p.content_hash.as_deref())
+                {
+                    Some(db_hash) if db_hash != hash => None,
+                    _ => Some((fingerprint.as_str(), hash.as_str())),
+                });
+            let memoized = super::content_hash::hash_directory_memoized(&skill_dir, cached);
+            // An unreadable file makes the hash unfit to cache: the read failure
+            // does not move ctime, so caching it would survive the failure.
+            if memoized.cacheable {
+                next_memo.insert(
+                    meta.skill_id.clone(),
+                    (memoized.fingerprint.clone(), memoized.hash.clone()),
+                );
+            }
+            let new_hash = Some(memoized.hash);
+            let updated_at = match previous {
+                Some(prev) if prev.content_hash == new_hash => prev.updated_at,
+                _ => now,
+            };
+
+            let record = SkillRecord {
+                id: meta.skill_id.clone(),
+                name,
+                description: parsed.description,
+                source_type: meta.source.source_type.clone(),
+                source_ref,
+                source_ref_resolved: previous.and_then(|s| s.source_ref_resolved.clone()),
+                source_subpath: meta.source.subpath.clone(),
+                source_branch: meta.source.branch.clone(),
+                source_revision: previous.and_then(|s| s.source_revision.clone()),
+                remote_revision: previous.and_then(|s| s.remote_revision.clone()),
+                central_path,
+                content_hash: new_hash,
+                enabled: meta.enabled,
+                created_at: previous.map(|s| s.created_at).unwrap_or(now),
+                updated_at,
+                status: "ok".to_string(),
+                update_status: previous
+                    .map(|s| s.update_status.clone())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                last_checked_at: previous.and_then(|s| s.last_checked_at),
+                last_check_error: previous.and_then(|s| s.last_check_error.clone()),
+            };
+            store.upsert_skill(&record)?;
+            store.set_tags_for_skill(&meta.skill_id, &meta.tags)?;
+        }
+
+        if has_complete_scenario_snapshot {
+            store.replace_scenarios_from_metadata(&scenarios)?;
+            store.replace_scenario_memberships_from_metadata(&memberships)?;
+        }
     }
 
     // Plus: persist the memo only once the reindex succeeded, so a failed run
@@ -371,6 +612,28 @@ pub(crate) fn reindex_from_metadata_unlocked(store: &SkillStore) -> Result<()> {
         }
     }
 
+    // Plus: persist the metadata manifest fingerprint once reindex succeeded in full,
+    // so subsequent runs hit the guard without reparsing metadata. Write only when
+    // it actually changed or an orphan was cleaned up.
+    if super::content_hash::HASH_MEMO_SUPPORTED {
+        if orphan_deleted {
+            current_manifest = fingerprint_metadata_tree(&meta_dir);
+        }
+        if !metadata_unchanged || orphan_deleted {
+            if let Some(ref manifest) = current_manifest {
+                let stored = store.get_setting(METADATA_MANIFEST_KEY).ok().flatten();
+                if stored.as_deref() != Some(&manifest.fingerprint) {
+                    if let Err(err) = store.set_setting(METADATA_MANIFEST_KEY, &manifest.fingerprint) {
+                        eprintln!("reindex: metadata manifest fingerprint not persisted: {err:#}");
+                    }
+                }
+            }
+            if let Err(err) = store.set_setting(METADATA_MANIFEST_VERIFIED_KEY, &now_secs.to_string()) {
+                eprintln!("reindex: metadata manifest verification timestamp not persisted: {err:#}");
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -388,7 +651,15 @@ pub(crate) fn ensure_skill_metadata_unlocked(store: &SkillStore, skill_id: &str)
         .get_skill_by_id(skill_id)?
         .ok_or_else(|| anyhow!("skill not found: {skill_id}"))?;
     let tags = store.get_tags_map()?.remove(skill_id).unwrap_or_default();
-    write_skill_file(&skill, &tags)
+    write_skill_file(&skill, &tags)?;
+
+    // Plus: invalidate stored manifest so the next reindex runs a full pass.
+    // Avoids O(n^2) tree rescans in bulk tag renames / mutations.
+    if super::content_hash::HASH_MEMO_SUPPORTED {
+        let _ = store.set_setting(METADATA_MANIFEST_KEY, "");
+    }
+
+    Ok(())
 }
 
 pub fn cleanup_temporary_files() -> Result<()> {
@@ -1279,6 +1550,305 @@ changed
         assert!(!is_sha256_hex(""));
         assert!(!is_sha256_hex(&"a".repeat(63)));
         assert!(!is_sha256_hex(&"g".repeat(64)));
+    }
+
+    // ---- plus: metadata manifest fingerprint guard ----
+
+    #[test]
+    fn manifest_fingerprint_changes_on_same_size_mtime_restored_write() {
+        let repo = test_repo();
+        let skill_dir = write_skill_dir("manifest-skill");
+        let record = sample_skill("skill-manifest", &skill_dir);
+        repo.store.insert_skill(&record).unwrap();
+        repo.store.set_tags_for_skill("skill-manifest", &["initial-tag".to_string()]).unwrap();
+        write_all_from_db_unlocked(&repo.store).unwrap();
+
+        let first = fingerprint_metadata_tree(&metadata_dir()).unwrap();
+        assert_eq!(first.skill_file_count, 1);
+
+        let meta_file = metadata_dir().join("skills/skill-manifest.json");
+        let content = std::fs::read(&meta_file).unwrap();
+        let meta = std::fs::metadata(&meta_file).unwrap();
+        let old_mtime = meta.modified().unwrap();
+
+        // Mutate in place keeping exact same byte length (valid JSON: "initial-tag" -> "revised-tag")
+        let mut new_content = content.clone();
+        let target = b"initial-tag";
+        let replacement = b"revised-tag";
+        assert_eq!(target.len(), replacement.len());
+        let pos = new_content
+            .windows(target.len())
+            .position(|w| w == target)
+            .expect("target tag string must exist in metadata json");
+        new_content[pos..pos + target.len()].copy_from_slice(replacement);
+        assert_eq!(content.len(), new_content.len(), "length must be identical");
+
+        std::fs::write(&meta_file, &new_content).unwrap();
+        let f = std::fs::File::open(&meta_file).unwrap();
+        f.set_modified(old_mtime).unwrap();
+
+        let meta_after = std::fs::metadata(&meta_file).unwrap();
+        assert_eq!(meta_after.len(), meta.len(), "size must be identical");
+        assert_eq!(meta_after.modified().unwrap(), old_mtime, "mtime must be identical");
+
+        let second = fingerprint_metadata_tree(&metadata_dir()).unwrap();
+        if super::super::content_hash::HASH_MEMO_SUPPORTED {
+            assert_ne!(
+                first.fingerprint, second.fingerprint,
+                "ctime alone must change the manifest fingerprint even when size and mtime are identical"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_fingerprint_changes_when_file_is_added_or_removed() {
+        let repo = test_repo();
+        let skill_dir = write_skill_dir("manifest-skill-2");
+        let record = sample_skill("skill-manifest-2", &skill_dir);
+        repo.store.insert_skill(&record).unwrap();
+        write_all_from_db_unlocked(&repo.store).unwrap();
+
+        let first = fingerprint_metadata_tree(&metadata_dir()).unwrap();
+
+        let extra_file = metadata_dir().join("skills/extra.json");
+        std::fs::write(&extra_file, b"{}").unwrap();
+
+        let second = fingerprint_metadata_tree(&metadata_dir()).unwrap();
+        assert_ne!(first.fingerprint, second.fingerprint);
+        assert_eq!(second.skill_file_count, 2);
+
+        std::fs::remove_file(&extra_file).unwrap();
+        let third = fingerprint_metadata_tree(&metadata_dir()).unwrap();
+        assert_eq!(first.fingerprint, third.fingerprint);
+    }
+
+    #[test]
+    fn reindex_skips_when_metadata_fingerprint_matches() {
+        let repo = test_repo();
+        let skill_dir = write_skill_dir("guard-skill");
+        let record = sample_skill("skill-guard", &skill_dir);
+        repo.store.insert_skill(&record).unwrap();
+        repo.store.set_tags_for_skill("skill-guard", &["initial-tag".to_string()]).unwrap();
+        write_all_from_db_unlocked(&repo.store).unwrap();
+
+        // Initial reindex populates DB and stores manifest fingerprint + verification stamp
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+        let stored = repo
+            .store
+            .get_setting(METADATA_MANIFEST_KEY)
+            .unwrap()
+            .expect("manifest fingerprint must be stored after reindex");
+        let current = fingerprint_metadata_tree(&metadata_dir()).unwrap();
+        assert_eq!(stored, current.fingerprint);
+
+        // Update DB tags without updating the metadata file.
+        // If the fast path runs, metadata JSON is not read and DB tags survive.
+        // If the full path runs, metadata JSON is parsed and overwrites DB tags.
+        repo.store.set_tags_for_skill("skill-guard", &["db-only-tag".to_string()]).unwrap();
+
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+
+        let tags = repo
+            .store
+            .get_tags_map()
+            .unwrap()
+            .remove("skill-guard")
+            .unwrap_or_default();
+        if super::super::content_hash::HASH_MEMO_SUPPORTED {
+            assert_eq!(
+                tags,
+                vec!["db-only-tag".to_string()],
+                "fast path must not re-read or overwrite DB state from metadata JSON"
+            );
+        }
+    }
+
+    #[test]
+    fn reindex_rebuilds_when_manifest_has_aged_out() {
+        let repo = test_repo();
+        let skill_dir = write_skill_dir("aged-manifest-skill");
+        let record = sample_skill("skill-aged-manifest", &skill_dir);
+        repo.store.insert_skill(&record).unwrap();
+        repo.store.set_tags_for_skill("skill-aged-manifest", &["initial".to_string()]).unwrap();
+        write_all_from_db_unlocked(&repo.store).unwrap();
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+
+        // Expire the metadata manifest verification stamp
+        repo.store.set_setting(METADATA_MANIFEST_VERIFIED_KEY, "1").unwrap();
+        repo.store.set_tags_for_skill("skill-aged-manifest", &["db-tag".to_string()]).unwrap();
+
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+
+        // Because TTL expired, full path was forced and reset tags from metadata JSON
+        let tags = repo
+            .store
+            .get_tags_map()
+            .unwrap()
+            .remove("skill-aged-manifest")
+            .unwrap_or_default();
+        assert_eq!(tags, vec!["initial".to_string()]);
+
+        let verified = repo.store.get_setting(METADATA_MANIFEST_VERIFIED_KEY).unwrap().unwrap();
+        if super::super::content_hash::HASH_MEMO_SUPPORTED {
+            assert!(verified.parse::<i64>().unwrap() > 1, "manifest verified timestamp must be refreshed");
+        }
+    }
+
+    #[test]
+    fn reindex_deletes_orphan_metadata_file_when_skill_dir_disappears() {
+        let repo = test_repo();
+        let skill_dir_1 = write_skill_dir("orphan-skill-1");
+        let record_1 = sample_skill("skill-orphan-1", &skill_dir_1);
+        repo.store.insert_skill(&record_1).unwrap();
+
+        let skill_dir_2 = write_skill_dir("orphan-skill-2");
+        let record_2 = sample_skill("skill-orphan-2", &skill_dir_2);
+        repo.store.insert_skill(&record_2).unwrap();
+        repo.store.set_tags_for_skill("skill-orphan-2", &["tag-2".to_string()]).unwrap();
+
+        write_all_from_db_unlocked(&repo.store).unwrap();
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+
+        let meta_file_1 = metadata_dir().join("skills/skill-orphan-1.json");
+        let trash_file_1 = metadata_dir().join(".trash/skill-orphan-1.json");
+        assert!(meta_file_1.is_file());
+
+        // Remove only the first skill directory on disk
+        std::fs::remove_dir_all(&skill_dir_1).unwrap();
+
+        // 2nd reindex deletes skill-1 and moves orphan metadata to .trash
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+
+        assert!(repo.store.get_skill_by_id("skill-orphan-1").unwrap().is_none());
+        assert!(!meta_file_1.exists(), "orphan metadata JSON must be removed from skills/");
+        assert!(trash_file_1.exists(), "orphan metadata JSON must be quarantined in .trash/");
+
+        // Mutate surviving skill's tags in DB
+        repo.store.set_tags_for_skill("skill-orphan-2", &["surviving-db-tag".to_string()]).unwrap();
+
+        // 3rd reindex: count matches (1 == 1, >0), manifest matches -> must take fast path!
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+
+        let tags = repo
+            .store
+            .get_tags_map()
+            .unwrap()
+            .remove("skill-orphan-2")
+            .unwrap_or_default();
+        if super::super::content_hash::HASH_MEMO_SUPPORTED {
+            assert_eq!(
+                tags,
+                vec!["surviving-db-tag".to_string()],
+                "self-healed fast path must be active after orphan quarantine"
+            );
+        }
+    }
+
+    #[test]
+    fn reindex_detects_same_size_metadata_edit() {
+        let repo = test_repo();
+        let skill_dir = write_skill_dir("edit-skill");
+        let record = sample_skill("skill-edit", &skill_dir);
+        repo.store.insert_skill(&record).unwrap();
+        repo.store.set_tags_for_skill("skill-edit", &["initial-tag".to_string()]).unwrap();
+        write_all_from_db_unlocked(&repo.store).unwrap();
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+
+        let meta_file = metadata_dir().join("skills/skill-edit.json");
+        let content = std::fs::read(&meta_file).unwrap();
+        let meta = std::fs::metadata(&meta_file).unwrap();
+        let old_mtime = meta.modified().unwrap();
+
+        // Same-length in-place rewrite + mtime restored (valid JSON: "initial-tag" -> "revised-tag")
+        let mut new_content = content.clone();
+        let target = b"initial-tag";
+        let replacement = b"revised-tag";
+        assert_eq!(target.len(), replacement.len());
+        let pos = new_content
+            .windows(target.len())
+            .position(|w| w == target)
+            .expect("target tag string must exist in metadata json");
+        new_content[pos..pos + target.len()].copy_from_slice(replacement);
+        assert_eq!(content.len(), new_content.len(), "length must be identical");
+
+        std::fs::write(&meta_file, &new_content).unwrap();
+        let f = std::fs::File::open(&meta_file).unwrap();
+        f.set_modified(old_mtime).unwrap();
+
+        // Mutate DB tag to verify if full path is forced
+        repo.store.set_tags_for_skill("skill-edit", &["db-temp-tag".to_string()]).unwrap();
+
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+
+        let tags = repo
+            .store
+            .get_tags_map()
+            .unwrap()
+            .remove("skill-edit")
+            .unwrap_or_default();
+        if super::super::content_hash::HASH_MEMO_SUPPORTED {
+            // Because ctime changed, fingerprint changed -> full path was forced and reset tags
+            assert_eq!(
+                tags,
+                vec!["revised-tag".to_string()],
+                "ctime modification must force full reindex and reload revised tag from metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_skill_metadata_unlocked_invalidates_manifest() {
+        let repo = test_repo();
+        let skill_dir = write_skill_dir("inv-skill");
+        let record = sample_skill("skill-inv", &skill_dir);
+        repo.store.insert_skill(&record).unwrap();
+        repo.store.set_tags_for_skill("skill-inv", &["tag-orig".to_string()]).unwrap();
+        write_all_from_db_unlocked(&repo.store).unwrap();
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+
+        // Single-file metadata writer invalidates manifest
+        ensure_skill_metadata_unlocked(&repo.store, "skill-inv").unwrap();
+
+        if super::super::content_hash::HASH_MEMO_SUPPORTED {
+            let stored = repo.store.get_setting(METADATA_MANIFEST_KEY).unwrap().unwrap();
+            assert!(stored.is_empty(), "single-file writer must invalidate stored manifest key");
+        }
+
+        // Change DB tag
+        repo.store.set_tags_for_skill("skill-inv", &["db-temp".to_string()]).unwrap();
+
+        // Reindex takes full path because manifest was invalidated
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+
+        let tags = repo
+            .store
+            .get_tags_map()
+            .unwrap()
+            .remove("skill-inv")
+            .unwrap_or_default();
+        assert_eq!(tags, vec!["tag-orig".to_string()]);
+    }
+
+    #[test]
+    fn write_all_from_db_does_not_advance_manifest_verified_stamp() {
+        let repo = test_repo();
+        let skill_dir = write_skill_dir("stamp-skill");
+        let record = sample_skill("skill-stamp", &skill_dir);
+        repo.store.insert_skill(&record).unwrap();
+        write_all_from_db_unlocked(&repo.store).unwrap();
+        reindex_from_metadata_unlocked(&repo.store).unwrap();
+
+        // Put an explicit timestamp into METADATA_MANIFEST_VERIFIED_KEY
+        repo.store.set_setting(METADATA_MANIFEST_VERIFIED_KEY, "12345").unwrap();
+
+        // write_all_from_db_unlocked must NOT advance the verification stamp
+        write_all_from_db_unlocked(&repo.store).unwrap();
+
+        let stamp = repo.store.get_setting(METADATA_MANIFEST_VERIFIED_KEY).unwrap().unwrap();
+        assert_eq!(
+            stamp, "12345",
+            "write_all_from_db must not advance the verification stamp"
+        );
     }
 
 }
