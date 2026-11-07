@@ -1,0 +1,39 @@
+main:
+  push:
+    - docker:
+        image: node:22
+      stages:
+        - name: 安装依赖
+          script: "npm ci"
+        - name: 检查
+          script: "npm run lint"
+        - name: 组件测试
+          script: "npm test"
+        - name: 构建
+          script: "npm run build"
+    - docker:
+        image: rust:1.96.1-bookworm
+      stages:
+        - name: 安装 Linux 系统依赖
+          script: "apt-get update && apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf"
+        - name: Linux Rust 编译检查
+          script: "cargo check --locked --manifest-path src-tauri/Cargo.toml"
+  pull_request:
+    - docker:
+        image: node:22
+      stages:
+        - name: 安装依赖
+          script: "npm ci"
+        - name: 检查
+          script: "npm run lint"
+        - name: 组件测试
+          script: "npm test"
+        - name: 构建
+          script: "npm run build"
+    - docker:
+        image: rust:1.96.1-bookworm
+      stages:
+        - name: 安装 Linux 系统依赖
+          script: "apt-get update && apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf"
+        - name: Linux Rust 编译检查
+          script: "cargo check --locked --manifest-path src-tauri/Cargo.toml"
